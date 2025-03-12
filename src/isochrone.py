@@ -62,7 +62,8 @@ class Isochrone(object):
         self.stop_times = None
 
         
-    # internal methods
+    ### internal methods
+    # gtfs specific methods
     def _handle_missing_calendar(
         self
     ) -> pd.DataFrame:
@@ -155,6 +156,7 @@ class Isochrone(object):
         else:
             return gf[(gf[ref_cols] == 1).all(axis=1)]
     
+    # handle transfers in transit isochrone
     def _add_transfers(
         self,
         all_stops: pd.DataFrame,
@@ -164,6 +166,8 @@ class Isochrone(object):
         walk_speed: float = 3,
         transfer_buffer_time: float = 1
     ) -> pd.DataFrame:
+        """Internal method. Do not call outside of transit_isochrone construction
+        """
         if transfers_allowed == 0:
             return all_stops
         ## stops in utm, euclidean buffer will have to do
@@ -186,8 +190,7 @@ class Isochrone(object):
         # need for analysis
         stop_times["stop_id"] = stop_times["stop_id"].astype(str)
         sid_rid_did = stop_times[["stop_id","route_id","direction_id"]].drop_duplicates()
-        print(all_stops)
-        print(all_stops.columns)
+
         full_data = [all_stops]
         while transfers_allowed > 0:
             transfer_data = []
@@ -210,7 +213,7 @@ class Isochrone(object):
                     stops_to_check["route_id"] != row["route_id"]
                 ]
                 if stops_to_check.empty:
-                    print(f"Processed transfers for stop {idx} out of {full_data[-1].index.max()}: no new stops on different routes")
+                    logging.debug(f"Processed transfers for stop {idx} out of {full_data[-1].index.max()}: no new stops on different routes")
                     continue
                 stops_to_check["distance_to_transfer_point"] = stops_to_check.distance(row_stop_loc)
                 
@@ -258,7 +261,7 @@ class Isochrone(object):
                 # remove all transfers which are outside the time window
                 stops_to_check = stops_to_check[stops_to_check["remaining_time_transfer"] > 0]
                 if stops_to_check.empty:
-                    print(f"Processed transfers for stop {idx} out of {full_data[-1].index.max()}: no transfers have enough time")
+                    logging.debug(f"Processed transfers for stop {idx} out of {full_data[-1].index.max()}: no transfers have enough time")
                     continue
                 stops_to_check = stops_to_check[[
                     "stop_id","route_id","direction_id","trip_id","stop_lat","stop_lon",
@@ -294,7 +297,7 @@ class Isochrone(object):
                 transfer_trips = transfer_trips[transfer_trips["remaining_time"] > 0]
                 
                 if transfer_trips.empty:
-                    print(f"Processed transfers for stop {idx} out of {full_data[-1].index.max()}: no legitimate transfers found")
+                    logging.debug(f"Processed transfers for stop {idx} out of {full_data[-1].index.max()}: no legitimate transfers found")
                 
                 transfer_trips["remaining_distance"] = (
                     walk_speed * (transfer_trips["remaining_time"] / 60) * 1609.344
@@ -317,7 +320,7 @@ class Isochrone(object):
                 transfer_trips["transfer_time"] = transfer_trips["total_transfer_time"] + row["transfer_time"]
                 transfer_trips.drop("total_transfer_time",axis=1,inplace=True)
                 transfer_data.append(transfer_trips)
-                print(f"Processed transfers for stop {idx} out of {full_data[-1].index.max()}")
+                logging.debug(f"Processed transfers for stop {idx} out of {full_data[-1].index.max()}")
             ##
             all_transfers = pd.concat(transfer_data, ignore_index=True)
             
@@ -353,7 +356,6 @@ class Isochrone(object):
             by="stop_id_stop_times",
             as_index=False
         )[["remaining_time"]].max()
-        final_data_gf_1.to_csv("final_transfers_gf.csv")
         final_data = final_data.merge(
             final_data_gf_1,
             on=["stop_id_stop_times","remaining_time"]
@@ -384,8 +386,7 @@ class Isochrone(object):
 
     def read_stop_times(
         self,
-        day_of_week: str,
-        time_of_day: str,
+        day_of_week: str
     ) -> pd.DataFrame:
         """Wrapper to get stop times only on a specific day or type of day"""
         calendar = self._calendar_from_day_type(day_of_week)
@@ -427,7 +428,7 @@ class Isochrone(object):
         # check that point is in box
         pt = Point(lng, lat)
         if not pt.within(self.bbox):
-            raise ValueError(f"lat/lng point {pt} must be within bounding box of stops in gtfs")
+            logging.critical(f"lat/lng point {pt} is not within bounding box of stops in gtfs")
         # check distance is legitimate
         if distance < 1:
             distance = 10
@@ -435,13 +436,13 @@ class Isochrone(object):
         cache_fname = f"{profile}_{lng}_{lat}_{distance}.geojson"
         cache_path = os.path.join(self.mapbox_cache_path, cache_fname)
         if os.path.isfile(cache_path):
-            print(f"Read data for {(distance, lat, lng, profile)} from cache")
+            logging.info(f"Read data for {(distance, lat, lng, profile)} from cache")
             return gpd.read_file(cache_path)
         res = requests.get(api_call)
         if cache:
             with open(cache_path, 'w') as f:
                 f.write(res.text)
-        print(f"Got data from mapbox API. Call: {(distance, lat, lng, profile)}")
+        logging.info(f"Got data from mapbox API. Call: {(distance, lat, lng, profile)}")
         return gpd.read_file(cache_path)
     
     def transit_isochrone(
@@ -454,7 +455,9 @@ class Isochrone(object):
         day_of_week: str = "weekday",
         time_strictness: str = "loose",
         intial_walk_time: float = None,
-        walk_speed: float = 3
+        walk_speed: float = 3,
+        dissolve: bool = True,
+        **kwargs
     ) -> gpd.GeoDataFrame:
         """Calculate transit isochrone from a given point
         Args:
@@ -470,12 +473,22 @@ class Isochrone(object):
             initial_walk_time (float): Maximum time to walk to first stop. If nothing is passed, will use
                 the full time allocation to search. Defaults to None
             walk_speed (float): assumed walking speed in mph. Defaults to 3
+            dissolve (bool): If data returned should be each polygon for each stop, or dissolved into one. Defaults to True
+        (Transfer related options):
+            max_transfer_walk_time (float): In minutes. Determines maximum distance away a transfer will be looked for. Defaults to 2
+            transfer_buffer_time (float): In minutes. Determines how much padding is needed to make a transfer in time. Defaults to 1
         """
-        ## TODO: add test for legitimate lat/lng
+        max_transfer_walk_time = kwargs.get("max_transfer_walk_time", 2)
+        transfer_buffer_time = kwargs.get("transfer_buffer_time", 1)
+        # check for point being within bounding box
+        pt = Point(lng, lat)
+        if not pt.within(self.bbox):
+            raise ValueError(f"lat/lng point {pt} must be within bounding box of stops in gtfs")
         ## calculate initial isochrone for stop placement
         if intial_walk_time is None:
             intial_walk_time = time
         initial_walk_distance = int(walk_speed * (intial_walk_time / 60) * 1609.344)
+        logging.debug("Fetching initial stop area isochrone")
         initial_isochrone = self.walking_isochrone(initial_walk_distance, lat, lng)
 
         ## convert to utm
@@ -484,9 +497,9 @@ class Isochrone(object):
         initial_isochrone_utm = initial_isochrone.to_crs(area_utm)
         stops = self.stops_gdf.to_crs(area_utm)
 
+        logging.debug("Determining initial starting stops")
         initial_stops = stops[stops.within(initial_isochrone_utm.loc[0]["geometry"])]
     
-        
         ## this must be the most expensive way to convert a point to a different proj
         start_gdf = gpd.GeoDataFrame(
             data = [1,],
@@ -504,7 +517,7 @@ class Isochrone(object):
         
         # now, add route
         stop_route = initial_stops.drop("geometry",axis=1)
-        stop_times = self.read_stop_times(day_of_week,time_of_day)
+        stop_times = self.read_stop_times(day_of_week)
         # reduce stop_times to only minimum by start_date
         stop_times_gf = stop_times.groupby(
             by=["stop_id","route_id","direction_id"],
@@ -571,6 +584,7 @@ class Isochrone(object):
             <= (self.time_str_to_num(time_of_day) + time)
         ]
 
+        logging.debug("Determining en route stops on each route from starting stops")
         # merge all stops on first trip
         all_stops = starting_stops_trip.merge(
             stop_times_near_tod,
@@ -627,14 +641,16 @@ class Isochrone(object):
         ]]
         all_stops["transfer"] = False
         all_stops["transfer_time"] = 0
-        ## here is where you should put transfers logic
+        
+        logging.debug("Adding transfers")
         all_stops = self._add_transfers(
             all_stops = all_stops, 
             stop_times = stop_times,
-            transfers_allowed = transfers
+            transfers_allowed = transfers,
+            walk_speed = walk_speed,
+            max_transfer_walk_time = max_transfer_walk_time,
+            transfer_buffer_time = transfer_buffer_time
         )
-        ## end transfers logic
-
         
         # merge back stop lat lng for stop_id_stop_times
         all_stops["stop_id"] = all_stops["stop_id"].astype(str)
@@ -662,7 +678,7 @@ class Isochrone(object):
             }
         ]
         for idx in all_stops.index:
-            print(f"Processing mapbox data for item {idx} out of {all_stops.index.max()}")
+            logging.debug(f"Processing mapbox data for item {idx} out of {all_stops.index.max()}")
             row = all_stops.loc[idx]
             res = self.walking_isochrone(
                 distance = row["remaining_distance"],
@@ -685,10 +701,9 @@ class Isochrone(object):
 
         df = pd.DataFrame(gdf_output)
         gdf = gpd.GeoDataFrame(data = df, geometry="geometry", crs=initial_isochrone.crs)
-        gdf_simple = gdf.dissolve()
-        print(gdf)
-        print(gdf_simple)
-        return gdf, gdf_simple
+        if dissolve:
+            gdf = gdf.dissolve()
+        return gdf
 
     def driving_isochrone(
         self,
@@ -705,87 +720,18 @@ class Isochrone(object):
         # check that point is in box
         pt = Point(lng, lat)
         if not pt.within(self.bbox):
-            raise ValueError(f"lat/lng point {pt} must be within bounding box of stops in gtfs")
-        # check distance is legitimate
-        if distance < 1:
-            distance = 10
+            logging.critical(f"lat/lng point {pt} is not within bounding box of stops in gtfs")
+        
         api_call = f"https://api.mapbox.com/isochrone/v1/mapbox/{profile}/{lng},{lat}?contours_minutes={int(time)}&polygons=true&access_token={self.mapbox_pk}"
         cache_fname = f"{profile}_{lng}_{lat}_{int(time)}.geojson"
         cache_path = os.path.join(self.mapbox_cache_path, cache_fname)
         if os.path.isfile(cache_path):
-            print(f"Read data for {(distance, lat, lng, profile)} from cache")
+            logging.info(f"Read data for {(int(time), lat, lng, profile)} from cache")
             return gpd.read_file(cache_path)
         res = requests.get(api_call)
         if cache:
             with open(cache_path, 'w') as f:
                 f.write(res.text)
-        print(f"Got data from mapbox API. Call: {(distance, lat, lng, profile)}")
+        logging.info(f"Got data from mapbox API. Call: {(int(time), lat, lng, profile)}")
         return gpd.read_file(cache_path)
 
-
-def test():
-    with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "mapbox.env"), "r") as f:
-        pk_dict = json.load(f)
-        mapbox_pk = pk_dict["mapbox_pk"]
-    ti = Isochrone(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "trimet"), mapbox_pk)
-    gdf, gdf_simple = ti.transit_isochrone(lat=45.5, lng=-122.5, time=30)
-    gdf.to_file(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "full_data.geojson"))
-    gdf_simple.to_file(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "full_data_simple.geojson"))
-
-def test_2():
-    with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "mapbox.env"), "r") as f:
-        pk_dict = json.load(f)
-        mapbox_pk = pk_dict["mapbox_pk"]
-    ti = Isochrone(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "trimet_2019"), mapbox_pk)
-    gdf, gdf_simple = ti.transit_isochrone(lat=45.518917, lng=-122.67922, time=30)
-    gdf.to_file(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "full_data_5.geojson"))
-    gdf_simple.to_file(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "full_data_simple_5.geojson"))
-
-def test_3():
-    with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "mapbox.env"), "r") as f:
-        pk_dict = json.load(f)
-        mapbox_pk = pk_dict["mapbox_pk"]
-    ti = Isochrone(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "trimet"), mapbox_pk)
-    gdf, gdf_simple = ti.transit_isochrone(
-        lat=45.51413, 
-        lng=-122.64534, 
-        time=30,
-        transfers=1,
-        time_of_day="08:00:00",
-        time_strictness="loose"
-    )
-    gdf.drop("geometry",axis=1).to_csv(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "apt_isochrone_2025.csv"))
-    gdf_simple.to_file(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "apt_isochrone_2025.geojson"))
-
-def milwaukie_test():
-    with open(os.path.join(os.path.dirname(os.path.dirname(__file__)), "mapbox.env"), "r") as f:
-        pk_dict = json.load(f)
-        mapbox_pk = pk_dict["mapbox_pk"]
-    lat = 45.44249
-    lng = -122.64002
-    ti_2025 = Isochrone(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "trimet"), mapbox_pk)
-    gdf, gdf_simple = ti_2025.transit_isochrone(
-        lat=lat, 
-        lng=lng, 
-        time=30,
-        transfers=1,
-        time_of_day="08:00:00",
-        time_strictness="loose"
-    )
-    gdf.drop("geometry",axis=1).to_csv(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "milwaukie_isochrone_2025.csv"))
-    gdf_simple.to_file(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "milwaukie_isochrone_2025.geojson"))
-    ti_2013 = Isochrone(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "trimet_2013"), mapbox_pk)
-    gdf, gdf_simple = ti_2013.transit_isochrone(
-        lat=lat, 
-        lng=lng, 
-        time=30,
-        transfers=1,
-        time_of_day="08:00:00",
-        time_strictness="loose"
-    )
-    gdf.drop("geometry",axis=1).to_csv(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "milwaukie_isochrone_2013.csv"))
-    gdf_simple.to_file(os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "milwaukie_isochrone_2013.geojson"))
-
-  
-if __name__ == "__main__":
-    milwaukie_test()
