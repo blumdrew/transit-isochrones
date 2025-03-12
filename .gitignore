@@ -169,3 +169,9 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+## project specific items
+*.DS_Store
+
+/data/*
+mapbox.env
