@@ -27,8 +27,16 @@ class Isochrone(object):
         gtfs_path: os.PathLike,
         mapbox_pk: str
     ) -> None:
-        if os.path.isdir(gtfs_path):
+        
+        if isinstance(gtfs_path, (list,tuple,set)):
+            # more than one gtfs path..
             self.gtfs_path = gtfs_path
+            self.gtfs_count = len(gtfs_path)
+            if not all(os.path.isdir(p) for p in gtfs_path):
+                raise FileNotFoundError("All GTFS paths must be real files")
+        elif os.path.isdir(gtfs_path):
+            self.gtfs_path = gtfs_path
+            self.gtfs_count = 1
         else:
             raise FileNotFoundError("GTFS path must point to existing path")
         self.mapbox_pk = mapbox_pk
@@ -40,12 +48,44 @@ class Isochrone(object):
         os.makedirs(self.mapbox_cache_path, exist_ok=True)
 
         # gtfs specifics needed for sanity (mostly stop bounding box for api calls)
-        self.stops = pd.read_csv(os.path.join(self.gtfs_path, "stops.txt"))
-        try:
-            self.calendar = pd.read_csv(os.path.join(self.gtfs_path, "calendar.txt"))
-        except FileNotFoundError:
-            self.calendar_dates = pd.read_csv(os.path.join(self.gtfs_path, "calendar_dates.txt"))
-            self.calendar = self._handle_missing_calendar()
+        self.stops = self._read_gtfs_file(gtfs_path=gtfs_path, file_name="stops.txt")
+        ## insance calendar logic...
+        if self.gtfs_count == 1:
+            try:
+                self.calendar = self._read_gtfs_file(self.gtfs_path, "calendar.txt")
+                self.calendar_dates = self._read_gtfs_file(self.gtfs_path, "calendar_dates.txt")
+                # test for calendar providing useful information..
+                all_cols = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+                if (self.calendar[all_cols] == 0).all().all():
+                    self.calendar = self._handle_missing_calendar()
+            except FileNotFoundError:
+                self.calendar_dates = self._read_gtfs_file(self.gtfs_path, "calendar_dates.txt")
+                self.calendar = self._handle_missing_calendar()
+        else:
+            # each calendar must be handled seperately!
+            # this sort of defeats the _read_gtfs_file method.. but whatever man
+            cals = []
+            cal_dates = []
+            for file in self.gtfs_path:
+                try:
+                    # calendar is optional!
+                    cal_loop = pd.read_csv(os.path.join(file, "calendar.txt"))
+                    cal_dates_loop = pd.read_csv(os.path.join(file, "calendar_dates.txt"))
+                    all_cols = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
+                    if (cal_loop[all_cols] == 0).all().all():
+                        cal_loop = self._handle_missing_calendar(cal_dates_loop)
+                except FileNotFoundError:
+                    cal_dates_loop = pd.read_csv(os.path.join(file, "calendar_dates.txt"))
+                    cal_loop = self._handle_missing_calendar(cal_dates_loop)
+                ## match logic for service_id in _read_gtfs_file
+                # df_loop[id_col] = df_loop[id_col].astype(str) + f'_{os.path.basename(pth)}'
+                cal_loop["service_id"] = cal_loop["service_id"].astype(str) + f'_{os.path.basename(file)}'
+                cal_dates_loop["service_id"] = cal_dates_loop["service_id"].astype(str) + f'_{os.path.basename(file)}'
+                cals.append(cal_loop)
+                cal_dates.append(cal_dates_loop)
+            self.calendar = pd.concat(cals)
+            self.calendar_dates = pd.concat(cal_dates)
+
         self.stops_gdf = gpd.GeoDataFrame(
             data = self.stops, 
             geometry = [Point(xy) for xy in zip(self.stops["stop_lon"],self.stops["stop_lat"])]
@@ -61,14 +101,52 @@ class Isochrone(object):
         self.trips = None
         self.stop_times = None
 
+    def _read_gtfs_file(
+        self,
+        gtfs_path,
+        file_name
+    ) -> pd.DataFrame:
+        """Method to handle reading in gtfs files for any number of GTFS paths,
+        passed in as a list of paths
+        """
+        # read in only the required columns, and use only the required columns
+        # this may reduce flexibility of using certain data, but ensures consistency
+        # across providers
+        file_column_map = {
+            "stops.txt":["stop_id","stop_lat","stop_lon"],
+            "trips.txt":["route_id","service_id","trip_id","direction_id","shape_id"],
+            "stop_times.txt":["stop_id","trip_id","arrival_time"],
+            "calendar.txt":["service_id","monday","tuesday","wednesday","thursday","friday","saturday","sunday","start_date","end_date"],
+            "calendar_dates.txt":["service_id","date","exception_type"]
+        }
+
+        cols = file_column_map[file_name]
+        if isinstance(gtfs_path, str):
+            # one path, simple
+            return pd.read_csv(os.path.join(gtfs_path, file_name))[cols]
+        
+        # for multiple paths, specific IDs may not be unique across agencies
+        # solution: use hash of path
+        dfs = []
+        for pth in gtfs_path:
+            df_loop = pd.read_csv(os.path.join(pth, file_name))[cols]
+            id_cols = [c for c in file_column_map[file_name] if c.endswith("_id")]
+            for id_col in id_cols:
+                df_loop[id_col] = df_loop[id_col].astype(str) + f'_{os.path.basename(pth)}'
+            dfs.append(df_loop)
+        return pd.concat(dfs)
         
     ### internal methods
     # gtfs specific methods
     def _handle_missing_calendar(
-        self
+        self,
+        custom_calendar_dates_df: pd.DataFrame = None
     ) -> pd.DataFrame:
         """Handle missing calendar by constructing it from calendar dates"""
-        temp = self.calendar_dates.copy()
+        if custom_calendar_dates_df is None:
+            temp = self.calendar_dates.copy()
+        else:
+            temp = custom_calendar_dates_df
         temp["date_obj"] = pd.to_datetime(temp["date"], format="%Y%m%d")
         temp["monday"] = np.where(temp["date_obj"].dt.day_of_week == 0, 1, 0)
         temp["tuesday"] = np.where(temp["date_obj"].dt.day_of_week == 1, 1, 0)
@@ -96,26 +174,35 @@ class Isochrone(object):
 
     def _calendar_from_day_type(
         self,
-        day_type: str
+        day_type: str,
+        custom_calendar_df: pd.DataFrame = None,
+        custom_calendar_dates_df: pd.DataFrame = None
     ) -> pd.DataFrame:
         # pass in day_type, return calendar df of those service_ids and s/e dates
-        # handle case when calendar is 0 for all days... why do you do this TriMet
+        # handle case when calendar is 0 for all days... why do you do this GTFS
+        if (custom_calendar_df is None) and (custom_calendar_dates_df is None):
+            cal = self.calendar.copy()
+            cal_dates = self.calendar_dates.copy()
+        else:
+            cal = custom_calendar_df
+            cal_dates = custom_calendar_dates_df
+        if (cal is None) or (cal_dates is None):
+            raise FileNotFoundError("Both calendar and cal dates must exist?")
         all_cols = ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"]
-        if (self.calendar[all_cols] == 0).all().all():
+
+        # this code is in the wrong place, needs to be done on calendar read...
+        if (cal[all_cols] == 0).all().all():
             # we need to make self.calender from calendar dates..
-            if self.calendar_dates is None or self.calendar_dates.empty:
-                self.calendar_dates = pd.read_csv(os.path.join(self.path,"calendar_dates.txt"))
-            
-            self.calendar_dates["date"] = pd.to_datetime(
-                self.calendar_dates["date"],
+            cal_dates["date"] = pd.to_datetime(
+                cal_dates["date"],
                 format="%Y%m%d"
             )
-            self.calendar_dates["day_of_week"] = self.calendar_dates["date"].dt.strftime("%A").str.lower()
+            cal_dates["day_of_week"] = cal_dates["date"].dt.strftime("%A").str.lower()
 
-            for dow in self.calendar_dates["day_of_week"].unique():
-                self.calendar_dates[dow] = (self.calendar_dates["day_of_week"] == dow).astype(int)
+            for dow in cal_dates["day_of_week"].unique():
+                cal_dates[dow] = (cal_dates["day_of_week"] == dow).astype(int)
 
-            gf = self.calendar_dates.groupby(
+            gf = cal_dates.groupby(
                 by=["service_id"],
                 as_index=False
             ).agg(
@@ -152,7 +239,7 @@ class Isochrone(object):
             ref_cols = [day_type]
 
         if not made_calender:
-            return self.calendar[(self.calendar[ref_cols] == 1).all(axis=1)]
+            return cal[(cal[ref_cols] == 1).all(axis=1)]
         else:
             return gf[(gf[ref_cols] == 1).all(axis=1)]
     
@@ -392,20 +479,18 @@ class Isochrone(object):
         calendar = self._calendar_from_day_type(day_of_week)
         # read trips
         if self.trips is None:
-            trips = pd.read_csv(os.path.join(self.gtfs_path, "trips.txt"))
+            trips = self._read_gtfs_file(self.gtfs_path, "trips.txt")
             self.trips = trips
         else:
             trips = self.trips
         trips = trips.merge(calendar, on="service_id", how="inner", suffixes=["","_calendar"])
         # read stop_times
         if self.stop_times is None:
-            stop_times = pd.read_csv(os.path.join(self.gtfs_path, "stop_times.txt"))
+            stop_times = self._read_gtfs_file(self.gtfs_path, "stop_times.txt")
             self.stop_times = stop_times
         else:
             stop_times = self.stop_times
-        
         stop_times = stop_times.merge(trips, on="trip_id", how="inner", suffixes=["","_trip"])
-        
         return_cols = [
             "stop_id","trip_id","route_id","direction_id",
             "shape_id","service_id","start_date","end_date",
@@ -477,6 +562,12 @@ class Isochrone(object):
         (Transfer related options):
             max_transfer_walk_time (float): In minutes. Determines maximum distance away a transfer will be looked for. Defaults to 2
             transfer_buffer_time (float): In minutes. Determines how much padding is needed to make a transfer in time. Defaults to 1
+        (TODO: Future behavior)
+            api_behaivor (literal 'greedy', 'check'): Determine how many API calls to make. If 'check', check if the 
+            current maximum walk buffer for the given point is within the set of all points already used. This check is done
+            via a Euclidean buffer of the same distance - which is strictly larger than a network buffer.
+            If 'greedy', API call will be made regardless of this. May result in more API calls, but computationally simpler,
+            as checking the Eucdlian buffer incurs some waste in unioning the geometries together each time. Defaults to (not implemented yet)
         """
         max_transfer_walk_time = kwargs.get("max_transfer_walk_time", 2)
         transfer_buffer_time = kwargs.get("transfer_buffer_time", 1)
@@ -484,6 +575,9 @@ class Isochrone(object):
         pt = Point(lng, lat)
         if not pt.within(self.bbox):
             raise ValueError(f"lat/lng point {pt} must be within bounding box of stops in gtfs")
+        # ensure time is <= 60
+        if time > 60:
+            raise ValueError("Maximum transit isochrone value is 60")
         ## calculate initial isochrone for stop placement
         if intial_walk_time is None:
             intial_walk_time = time
@@ -499,7 +593,7 @@ class Isochrone(object):
 
         logging.debug("Determining initial starting stops")
         initial_stops = stops[stops.within(initial_isochrone_utm.loc[0]["geometry"])]
-    
+        
         ## this must be the most expensive way to convert a point to a different proj
         start_gdf = gpd.GeoDataFrame(
             data = [1,],
@@ -514,7 +608,6 @@ class Isochrone(object):
             (initial_stops["distance_to_start"] / 1609.344)
             / (walk_speed / 60)
         )
-        
         # now, add route
         stop_route = initial_stops.drop("geometry",axis=1)
         stop_times = self.read_stop_times(day_of_week)
@@ -523,7 +616,6 @@ class Isochrone(object):
             by=["stop_id","route_id","direction_id"],
             as_index=False
         )[["start_date"]].min()
-        
         stop_times = stop_times.merge(
             stop_times_gf,
             on=["stop_id","route_id","direction_id","start_date"],
@@ -577,13 +669,11 @@ class Isochrone(object):
             how="inner",
             on=["stop_id","route_id","direction_id","arrival_time_num"]
         )
-
         # reduce to only trips within [time] of start time
         starting_stops_trip = starting_stops_trip[
             starting_stops_trip["arrival_time_num"] 
             <= (self.time_str_to_num(time_of_day) + time)
         ]
-
         logging.debug("Determining en route stops on each route from starting stops")
         # merge all stops on first trip
         all_stops = starting_stops_trip.merge(
@@ -639,6 +729,7 @@ class Isochrone(object):
             "arrival_time_num","stop_id_stop_times","arrival_time_stop_times",
             "arrival_time_num_stop_times","elapsed_time","remaining_time","remaining_distance"
         ]]
+
         all_stops["transfer"] = False
         all_stops["transfer_time"] = 0
         
