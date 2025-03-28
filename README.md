@@ -24,3 +24,4 @@ Call the `transit_isochrone` function on any lat/lng point. Required arguments:
 
 ## Example outputs
 
+[CTRAN + TriMet, 45 Minutes from Downtown Vancouver](examples/ctran-trimet-45-min.geojson)
